@@ -26,6 +26,89 @@ static thread_func start_pthread NO_RETURN;
 static bool load(const char* file_name, void (**eip)(void), void** esp);
 bool setup_thread(void (**eip)(void), void** esp);
 
+#define MAX_ARGS 32
+
+// Simple tokenizer: split by spaces and ignore extra spaces
+static int tokenize_cmdline(const char* cmdline, char* argv[], int max_args, char* buf, size_t buf_sz) {
+  // Copy into a temporary buffer for in-place tokenization
+  strlcpy(buf, cmdline, buf_sz);
+  int argc = 0;
+  char* p = buf;
+
+  // Skip leading spaces
+  while (*p == ' ') p++;
+  while (*p != '\0' && argc < max_args) {
+    argv[argc++] = p;
+    // Advance to the next space or end of string
+    while (*p != '\0' && *p != ' ') p++;
+    if (*p == '\0') break;
+    // Terminate token at space and skip subsequent spaces
+    *p++ = '\0';
+    while (*p == ' ') p++;
+  }
+  return argc;
+}
+
+// Push argv/strings onto the user stack; lay out stack for _start(argc, argv) per i386 cdecl
+static bool push_args_to_stack(const char* cmdline, void** esp, int* out_argc) {
+  // 1) Tokenize
+  char* argv_k[MAX_ARGS];
+  char buf[PGSIZE];
+  int argc = tokenize_cmdline(cmdline, argv_k, MAX_ARGS, buf, sizeof buf);
+
+  // Ensure argc >= 1 even without extra args (argv[0] = program name)
+  if (argc == 0) {
+    // In practice, run_task in init.c supplies at least the program name
+    return false;
+  }
+
+  // 2) Copy each string onto the user stack (from high to low addresses)
+  uint8_t* sp = (uint8_t*)(*esp);
+  char* uargv[MAX_ARGS];
+
+  for (int i = argc - 1; i >= 0; --i) {
+    size_t len = strlen(argv_k[i]) + 1; // including '\0'
+    if (sp - len < (uint8_t*)PHYS_BASE - PGSIZE)
+      return false; // insufficient stack space
+    sp -= len;
+    memcpy(sp, argv_k[i], len);
+    uargv[i] = (char*)sp; // record the user-space address of this string
+  }
+
+  // 3) Compute padding: ensure esp % 16 == 12 at entry to _start (so after calling main tests pass) and keep 32-bit stores 4-byte aligned
+  uintptr_t sp_mod16 = (uintptr_t)sp & 0xFu;
+  size_t word_pushes = (size_t)argc + 4; // NULL + argv[i]*argc + argv + argc + fake return
+  size_t rest_bytes = 4 * word_pushes;
+  size_t pad = (sp_mod16 - ((rest_bytes + 12) & 0xFu)) & 0xFu;
+  if (sp - pad < (uint8_t*)PHYS_BASE - PGSIZE) return false;
+  sp -= pad;
+  memset(sp, 0, pad);
+
+  // 4) Push argv[argc] = NULL
+  if (sp - 4 < (uint8_t*)PHYS_BASE - PGSIZE) return false;
+  sp -= 4;
+  *(uint32_t*)sp = 0;
+
+  // 5) Push addresses of argument strings in reverse order to build the argv array
+  for (int i = argc - 1; i >= 0; --i) {
+    if (sp - 4 < (uint8_t*)PHYS_BASE - PGSIZE) return false;
+    sp -= 4;
+    *(uint32_t*)sp = (uint32_t)uargv[i];
+  }
+  // Record the start address of the argv array (on the user stack)
+  uint32_t argv_ptr = (uint32_t)sp;
+
+  // 6) Push argv pointer, argc, and a fake return address
+  if (sp - 12 < (uint8_t*)PHYS_BASE - PGSIZE) return false;
+  sp -= 4; *(uint32_t*)sp = argv_ptr;  // argv
+  sp -= 4; *(uint32_t*)sp = (uint32_t)argc; // argc
+  sp -= 4; *(uint32_t*)sp = 0; // fake return address
+
+  *esp = sp;
+  if (out_argc) *out_argc = argc;
+  return true;
+}
+
 /* Initializes user programs in the system by ensuring the main
    thread has a minimal PCB so that it can execute and wait for
    the first user process. Any additions to the PCB should be also
@@ -61,9 +144,23 @@ pid_t process_execute(const char* file_name) {
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy(fn_copy, file_name, PGSIZE);
+  
+  // Use only the program name as the thread name
+  char thread_name[16];
+  {
+    size_t i = 0;
+    // Skip leading spaces
+    const char* p = file_name;
+    while (*p == ' ') p++;
+    while (i + 1 < sizeof(thread_name) && p[i] != '\0' && p[i] != ' ') {
+      thread_name[i] = p[i];
+      i++;
+    }
+    thread_name[i] = '\0';
+  }
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create(thread_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
     palloc_free_page(fn_copy);
   return tid;
@@ -99,7 +196,24 @@ static void start_process(void* file_name_) {
     if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
-    success = load(file_name, &if_.eip, &if_.esp);
+    // Load the ELF using only the program name
+    char prog_name[16];
+    {
+        size_t i = 0;
+        const char* p = file_name;
+        while (*p == ' ') p++;
+        while (i + 1 < sizeof(prog_name) && p[i] != '\0' && p[i] != ' '){
+            prog_name[i] = p[i];
+            i++;
+        }
+        prog_name[i] = '\0';
+    }
+    success = load(prog_name, &if_.eip, &if_.esp);
+    if (success) {
+        // Push command-line arguments onto the user stack to build _start(argc, argv)
+        int argc = 0;
+        success = push_args_to_stack(file_name, (void**)&if_.esp, &argc);
+    }
   }
 
   /* Handle failure with succesful PCB malloc. Must free the PCB */

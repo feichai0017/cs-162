@@ -4,6 +4,7 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "userprog/process.h"
+#include "lib/kernel/stdio.h"
 
 static void syscall_handler(struct intr_frame*);
 

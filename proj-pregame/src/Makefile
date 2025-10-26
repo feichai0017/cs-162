@@ -31,3 +31,10 @@ cscope:: cscope.files
 format::
 	find . -name build -prune -o -type f -name '*.[ch]' -print | \
 	xargs clang-format -i -style=file
+
+.PHONY: everything
+everything:
+	$(MAKE) -C threads clean
+	$(MAKE) -C threads -j
+	$(MAKE) -C examples clean
+	$(MAKE) -C examples -j
