@@ -10,3 +10,6 @@ words
 !lwords_arm.o
 !word_count_arm.o
 !word_helpers_arm.o
+
+.cache/
+compile_commands.json
